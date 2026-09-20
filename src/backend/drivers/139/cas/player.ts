@@ -260,11 +260,102 @@ async function setCachedCasLink(
 /**
  * 清空一级直链缓存（供测试使用）。
  *
- * ⚠️ 仅清内存，不动 KV —— 测试用真实 KV 会污染线上数据。
+ * ⚠️ 仅清内存，不动 Cache API —— 测试用真实缓存会污染线上数据。
  * 正常播放不需要调用它，TTL 会自然淘汰。
  */
 export function clearCasLinkCache(): void {
   casLinkCache.clear()
+  memTempDir.clear()
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 临时目录 ID 缓存（省掉「列根目录找 TEMP」的一次往返）
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * ⚠️ 为什么必须做持久化缓存（而非只挂在驱动实例上）
+ *
+ * `driver.ts` 原本把 TEMP 目录 ID 存在 `this.tempDirId`（实例字段）上，
+ * 但 **CF Workers 每个请求都新建驱动实例** —— 实例字段活不过单个请求，
+ * 下一次播放 `opts.tempDirId` 必然是空 → `ensureTempDir()` 每次都去
+ * **列一遍根目录**找 TEMP 目录（一次跨洲往返，约 1 秒）。
+ *
+ * 与直链缓存同理：进程内状态在 CF 上不可靠，必须放到 Cache API。
+ *
+ * 与直链的区别：TEMP 目录 ID **不会过期**（目录一直在那儿），
+ * 因此 TTL 给足（24 小时），远超直链的 10 分钟。
+ */
+const CAS_TEMPDIR_TTL_S = 24 * 60 * 60
+
+/** Cache API key：与直链共用内部域名，不同前缀区分 */
+function casTempDirKeyUrl(rootId: string): string {
+  return `${CAS_CACHE_ORIGIN}/tempdir/${encodeURIComponent(rootId || "root")}`
+}
+
+/** 进程内一级缓存：TEMP 目录 ID（同一 isolate 内零网络命中） */
+const memTempDir = new Map<string, string>()
+
+/**
+ * 取已缓存的 TEMP 目录 ID；未命中返回 undefined。
+ *
+ * 读失败一律静默降级（缓存只是优化，不能影响播放）。
+ */
+export async function getCachedTempDirId(
+  rootId: string,
+): Promise<string | undefined> {
+  const mk = rootId || "root"
+  const local = memTempDir.get(mk)
+  if (local) return local
+
+  const c = getCacheApi()
+  if (!c?.match) return undefined
+
+  try {
+    const res = await withTimeout<Response>(
+      c.match(casTempDirKeyUrl(rootId)),
+      CAS_CACHE_TIMEOUT_MS,
+      "读 TEMP 目录缓存",
+    )
+    if (!res) return undefined
+    const id = (await withTimeout(
+      res.text(),
+      CAS_CACHE_TIMEOUT_MS,
+      "解析 TEMP 目录缓存",
+    )).trim()
+    if (!id) return undefined
+    memTempDir.set(mk, id)
+    return id
+  } catch {
+    return undefined
+  }
+}
+
+/** 写入 TEMP 目录 ID 缓存（内存 + Cache API） */
+export function setCachedTempDirId(rootId: string, tempDirId: string): void {
+  if (!tempDirId) return
+  const mk = rootId || "root"
+  memTempDir.set(mk, tempDirId)
+
+  const c = getCacheApi()
+  if (!c?.put) return
+
+  void (async () => {
+    try {
+      const res = new Response(tempDirId, {
+        headers: {
+          "Content-Type": "text/plain",
+          "Cache-Control": `public, max-age=${CAS_TEMPDIR_TTL_S}`,
+        },
+      })
+      await withTimeout(
+        c.put(casTempDirKeyUrl(rootId), res),
+        CAS_CACHE_TIMEOUT_MS,
+        "写 TEMP 目录缓存",
+      )
+    } catch {
+      // 忽略
+    }
+  })()
 }
 
 /** 默认允许播放的扩展名 */
@@ -413,7 +504,14 @@ export async function resolveCasPlayLink(
   step = "tempdir"
   let tempDirId = ""
   try {
-    tempDirId = await ensureTempDir(client, rootId, opts.tempDirId)
+    // 目录 ID 的来源优先级：
+    //   ① 调用方传入（同请求内已知，最快）
+    //   ② Cache API 持久缓存（跨请求 / 跨 isolate，省一次列根目录往返）
+    //   ③ 回源列根目录找 TEMP
+    const known = opts.tempDirId || (await getCachedTempDirId(rootId))
+    tempDirId = await ensureTempDir(client, rootId, known)
+    // 顺手回填缓存：下次播放直接命中，无需再列根目录
+    setCachedTempDirId(rootId, tempDirId)
   } catch (e) {
     throw new CasPlayError(
       `[step=${step}] ${e instanceof Error ? e.message : String(e)}`,
