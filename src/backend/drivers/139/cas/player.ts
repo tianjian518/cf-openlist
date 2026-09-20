@@ -20,7 +20,6 @@ import {
   sweepTempFiles,
 } from "./restore"
 import { Yun139ApiClient, fetchWithTimeout, withTimeout } from "../util"
-import { getEnvCtx } from "../../../internal/model/db"
 
 /** 播放直链结果 */
 export interface CasPlayLink {
@@ -66,7 +65,7 @@ export class CasPlayError extends Error {
  * 这正是线上**偶发 503** 的主因。而 139 的下载直链本身有效期约 15 分钟，
  * 同一条 URL 完全可以复用。
  *
- * ## ⚠️ 为什么必须用 KV 而不是模块级 Map
+ * ## ⚠️ 为什么必须用 KV/Cache 而不是模块级 Map
  *
  * 最初这里用模块级 `Map` 实现，**实测完全无效**（302 生成仍要 3~13 秒）。
  * 原因是 CF Workers 的调度模型：**同一份模块状态只在同一个 isolate 内共享**，
@@ -76,8 +75,26 @@ export class CasPlayError extends Error {
  * 实测证据：同一 URL 连打 10 次 `HEAD`，耗时 3.3 / 4.2 / 5.0 / 8.3 /
  * 9.0 / 10.0 / 11.6 / 12.8 / 13.2 秒 —— 毫无收敛趋势，说明每次都重跑链路。
  *
- * 因此改用 **KV** 作为共享缓存层（KV 在所有 isolate / 所有边缘节点间一致），
- * 模块级 Map 退化为**一级缓存**：同一 isolate 内命中可完全跳过网络。
+ * ## ⚠️⚠️ 曾经的严重误判：KV 会撞「每日 1000 次写」配额（血泪）
+ *
+ * 后来改用 **KV** 作共享缓存层（KV 跨 isolate / 跨节点一致），**线上依然不命中**。
+ *
+ * 线上实测证据（决定性的）：
+ *
+ *     GET /storage/kv/namespaces/<主KV>/keys?prefix=caslink:  →  0 条
+ *
+ * 代码明明 `await kv.put("caslink:" + id, ...)`，线上**一个键都没有**。
+ * 原因：CF 免费版 KV **每天仅 1000 次写入**，而 `openlist_config`、
+ * `opencas_139_idx_*` 等主配置也共用同一个 KV，几百次播放就把当日写配额打满，
+ * `put` 全部失败 —— 且被 `catch {}` 静默吞掉，**不留任何日志**。
+ * 写不进去 ⇒ 缓存永远为空 ⇒ 每次播放仍重跑整条链路 ⇒ 稳定 8~13 秒。
+ *
+ * 正解：改用 **Cache API**（`caches.default`）。它走 CDN 边缘缓存，
+ * **不消耗 KV 写配额、写入不需等待、不会失败**，天然按 PoP 分布，
+ * 正适合「读多写少、允许轻微陈旧」的直链加速场景。
+ *
+ * ⚠️ 注意：Cache API 的缓存是**按机房（PoP）隔离**的，跨洲不共享。
+ * 但只要出口机房稳定，同机房内的重复播放即可零网络往返命中。
  *
  * ## 缓存键为什么是 `casFileId`
  *
@@ -106,8 +123,11 @@ const CAS_LINK_TTL_MS = 10 * 60 * 1000
 /** 一级缓存容量上限（per-isolate），防止长时间存活的 isolate 无限增长 */
 const CAS_LINK_CACHE_MAX = 200
 
-/** KV 中直链缓存的键前缀 */
+/** 直链缓存的键前缀（Cache API 的 URL 路径里复用同一前缀，便于排查） */
 const CAS_LINK_KV_PREFIX = "caslink:"
+
+/** Cache API 的 key 必须是一个 URL，这里用内部域名占位（不会真正请求） */
+const CAS_CACHE_ORIGIN = "https://caslink.internal"
 
 /** 一级缓存：模块级 Map，仅在同一 isolate 内有效（快，但覆盖不全） */
 const casLinkCache = new Map<string, CasLinkCacheEntry>()
@@ -138,39 +158,34 @@ function setLocalCasLink(casFileId: string, entry: CasLinkCacheEntry): void {
 }
 
 /**
- * 直链缓存所需的 KV 最小接口。
- *
- * 这里刻意**不引用 `KVNamespace` 全局类型** —— 该类型只在
- * `@cloudflare/workers-types` 被引入时才存在，本地 `tsc` 会报
- * `Cannot find name 'KVNamespace'`。缓存只用到 get/put，按需声明更稳。
+ * Cache API 读写超时：纯优化手段，超时即降级为回源，不能拖慢主流程。
+ * 与 `../linkcache.ts` 保持同一取值。
  */
-interface CasLinkKv {
-  get(
-    key: string,
-    type?: "text" | "json",
-  ): Promise<unknown> | unknown
-  put(key: string, value: string, opts?: unknown): Promise<void> | void
+const CAS_CACHE_TIMEOUT_MS = 800
+
+/** Cache API 的 key 用一个内部域名，路径里带前缀与 fileId */
+function casCacheKeyUrl(casFileId: string): string {
+  return `${CAS_CACHE_ORIGIN}/${CAS_LINK_KV_PREFIX}${encodeURIComponent(casFileId)}`
 }
 
 /**
- * 取得 KV 命名空间（未绑定时返回 null，缓存自动降级为仅一级）。
+ * 取 Cache API 实例。
  *
- * 走 `getEnvCtx()`（由 index.ts 的中间件在请求入口 `setEnvCtx(env)` 注入），
- * 而不是直接摸 `globalThis` —— 后者是历史遗留写法，且跨请求不保证已赋值。
+ * `caches.default` 在 CF Workers 上始终可用；本地 Node / 测试环境没有，
+ * 返回 undefined 于是缓存退化为纯进程内（不影响正确性）。
  */
-function getKv(): CasLinkKv | null {
+function getCacheApi(): any {
   try {
-    const kv = (getEnvCtx() as any)?.KV as CasLinkKv | undefined
-    return kv && typeof kv.get === "function" ? kv : null
+    return (globalThis as any).caches?.default
   } catch {
-    return null
+    return undefined
   }
 }
 
 /**
- * 读取直链缓存：先查一级（内存），再查 KV。
+ * 读取直链缓存：先查一级（内存），再查 Cache API。
  *
- * KV 读取失败（网络抖动、未绑定）一律静默降级为「未命中」——
+ * 读失败（未命中、超时、环境不支持）一律静默降级为「未命中」——
  * 缓存只是优化手段，绝不能因为它出错而让播放失败。
  */
 async function getCachedCasLink(
@@ -179,13 +194,22 @@ async function getCachedCasLink(
   const local = getLocalCasLink(casFileId)
   if (local) return local
 
-  const kv = getKv()
-  if (!kv) return null
+  const c = getCacheApi()
+  if (!c?.match) return null
 
   try {
-    const raw = await kv.get(CAS_LINK_KV_PREFIX + casFileId, "json")
-    if (!raw || typeof (raw as any).url !== "string") return null
-    const entry = raw as CasLinkCacheEntry
+    const res = await withTimeout<Response>(
+      c.match(casCacheKeyUrl(casFileId)),
+      CAS_CACHE_TIMEOUT_MS,
+      "读 CAS 直链缓存",
+    )
+    if (!res) return null
+    const entry = (await withTimeout(
+      res.json(),
+      CAS_CACHE_TIMEOUT_MS,
+      "解析 CAS 直链缓存",
+    )) as CasLinkCacheEntry
+    if (!entry || typeof entry.url !== "string") return null
     if (Date.now() - (entry.at || 0) > CAS_LINK_TTL_MS) return null
     // 回填一级缓存，后续同 isolate 请求可零网络命中
     setLocalCasLink(casFileId, entry)
@@ -196,10 +220,13 @@ async function getCachedCasLink(
 }
 
 /**
- * 写入直链缓存：同时写一级与 KV。
+ * 写入直链缓存：同时写一级与 Cache API。
  *
- * ⚠️ 一律 `await` KV 的写入 —— Workers 的 `waitUntil` 只保证约 30 秒，
- * 而 KV 写本身很快（通常 <100ms），直接等待最可靠。
+ * ⚠️ 与旧的 KV 实现的关键差别：
+ *   - **不消耗任何写配额**，不会因每日 1000 次写上限而静默全失败；
+ *   - 写入**不需要 await 到落盘**（Cache API 是即发即忘的边缘缓存）。
+ *
+ * TTL 由响应的 `Cache-Control: max-age` 承担，过期自动不可命中。
  * 写失败静默忽略（同样地，不能因缓存而影响播放）。
  */
 async function setCachedCasLink(
@@ -208,12 +235,23 @@ async function setCachedCasLink(
   ttlSec: number,
 ): Promise<void> {
   setLocalCasLink(casFileId, entry)
-  const kv = getKv()
-  if (!kv) return
+
+  const c = getCacheApi()
+  if (!c?.put) return
+
   try {
-    await kv.put(CAS_LINK_KV_PREFIX + casFileId, JSON.stringify(entry), {
-      expirationTtl: ttlSec,
+    const res = new Response(JSON.stringify(entry), {
+      headers: {
+        "Content-Type": "application/json",
+        // Cache API 依据响应头决定 TTL；过期后自动不可命中
+        "Cache-Control": `public, max-age=${ttlSec}`,
+      },
     })
+    await withTimeout(
+      c.put(casCacheKeyUrl(casFileId), res),
+      CAS_CACHE_TIMEOUT_MS,
+      "写 CAS 直链缓存",
+    )
   } catch {
     // 忽略：一级缓存仍然可用
   }

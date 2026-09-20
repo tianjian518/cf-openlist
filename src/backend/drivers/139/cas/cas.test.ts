@@ -390,34 +390,42 @@ test("resolveCasPlayLink 二次调用命中缓存，不再发起任何网络往�
   }
 })
 
-test("直链缓存必须走 KV 共享（仅内存 Map 在 CF 上无效）", async () => {
+test("直链缓存必须走 Cache API 共享（仅内存 Map 在 CF 上无效）", async () => {
   // ⚠️ 这是本缓存实现的**核心回归点**，用血泪换来：
   //
-  // 最初用模块级 `Map` 做缓存，实测**完全无效** —— 同一 URL 连打 10 次
-  // HEAD，耗时 3.3/4.2/5.0/8.3/9.0/10.0/11.6/12.8/13.2 秒，毫无收敛趋势。
-  // 原因是 CF Workers 按负载把请求分散到**多个 isolate**，模块级状态
-  // 不跨 isolate 共享，于是"刚写入的直链"下次请求根本读不到。
+  // ① 最初用模块级 `Map` 做缓存，实测**完全无效** —— 同一 URL 连打 10 次
+  //    HEAD，耗时 3.3/4.2/5.0/8.3/9.0/10.0/11.6/12.8/13.2 秒，毫无收敛趋势。
+  //    原因是 CF Workers 按负载把请求分散到**多个 isolate**，模块级状态
+  //    不跨 isolate 共享，于是"刚写入的直链"下次请求根本读不到。
   //
-  // 因此契约是：缓存**必须**读写 KV（KV 在所有 isolate / 边缘节点间一致），
+  // ② 后来改用 **KV**，线上**依然不命中**。决定性证据：
+  //       GET .../kv/namespaces/<主KV>/keys?prefix=caslink:  →  0 条
+  //    代码明明 `await kv.put("caslink:" + id, ...)`，线上一个键都没有 ——
+  //    CF 免费版 KV **每天仅 1000 次写入**，与主配置共用同一 KV，几百次
+  //    播放即打满配额，`put` 全部失败且被 catch 静默吞掉。
+  //
+  // 因此契约是：缓存**必须**读写 Cache API（跨 isolate 共享、**零写配额**），
   // 内存 Map 只能作为一级加速层存在。
+  //
+  // ⚠️ 本测试**不得**再打桩 KV —— 一旦实现回退到 KV，此测试必须失败。
   const { client, casContent } = makeCountableClient()
 
-  // 打桩一个最小 KV，记录读写次数
-  const kvCalls = { get: 0, put: 0 }
+  // 打桩一个最小 Cache API，记录读写次数
+  const cacheCalls = { match: 0, put: 0 }
   const store = new Map<string, string>()
-  const fakeKv = {
-    async get(key: string) {
-      kvCalls.get++
-      return store.get(key) ?? null
+  const fakeCache = {
+    async match(key: string) {
+      cacheCalls.match++
+      const body = store.get(key)
+      return body === undefined ? undefined : new Response(body, { status: 200 })
     },
-    async put(key: string, value: string) {
-      kvCalls.put++
-      store.set(key, value)
+    async put(key: string, res: Response) {
+      cacheCalls.put++
+      store.set(key, await res.text())
     },
   }
-  const db: any = await import("../../../internal/model/db")
-  const realEnv = db.getEnvCtx()
-  db.setEnvCtx({ ...(realEnv || {}), KV: fakeKv } as any)
+  const realCaches = (globalThis as any).caches
+  ;(globalThis as any).caches = { default: fakeCache }
 
   const realFetch = globalThis.fetch
   globalThis.fetch = (async () =>
@@ -428,34 +436,37 @@ test("直链缓存必须走 KV 共享（仅内存 Map 在 CF 上无效）", asyn
     await resolveCasPlayLink({
       client,
       rootId: "/",
-      casFileId: "cas-kv-1",
+      casFileId: "cas-cache-1",
       casName: "movie.mkv.cas",
       autoCleanup: false,
     } as any)
 
-    // 首次：链路跑完后必须把直链写进 KV
-    assert.ok(kvCalls.put >= 1, `首次播放后应向 KV 写入直链，实际 put=${kvCalls.put}`)
+    // 首次：链路跑完后必须把直链写进 Cache API
+    assert.ok(
+      cacheCalls.put >= 1,
+      `首次播放后应向 Cache API 写入直链，实际 put=${cacheCalls.put}`,
+    )
 
     // 清掉内存一级缓存，模拟"请求被分派到另一个 isolate"
     clearCasLinkCache()
-    const before = { ...kvCalls }
+    const before = { ...cacheCalls }
 
     await resolveCasPlayLink({
       client,
       rootId: "/",
-      casFileId: "cas-kv-1",
+      casFileId: "cas-cache-1",
       casName: "movie.mkv.cas",
       autoCleanup: false,
     } as any)
 
     assert.ok(
-      kvCalls.get > before.get,
-      `跨 isolate 必须回落到 KV 读取，实际 get 增量=${kvCalls.get - before.get}`,
+      cacheCalls.match > before.match,
+      `跨 isolate 必须回落到 Cache API 读取，实际 match 增量=${cacheCalls.match - before.match}`,
     )
   } finally {
     globalThis.fetch = realFetch
     clearCasLinkCache()
-    db.setEnvCtx(realEnv as any)
+    ;(globalThis as any).caches = realCaches
   }
 })
 
