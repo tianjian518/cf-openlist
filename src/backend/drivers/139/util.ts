@@ -10,6 +10,12 @@ import {
   PersonalDownloadResp,
   PersonalFileItem,
 } from "./types"
+import {
+  getCachedLink,
+  setCachedLink,
+  getCachedList,
+  setCachedList,
+} from "./linkcache"
 
 /**
  * 与官方 Go 实现 `url.QueryEscape` + 补充转义保持一致的编码。
@@ -167,6 +173,15 @@ export class Yun139ApiClient {
   private authValue = ""
   /** 是否已执行过初始化（路由策略只需查一次） */
   private inited = false
+
+  /**
+   * 当前存储的 ID 与运行时 env。
+   *
+   * 由驱动的 `setRuntimeContext` 注入，供直链/目录缓存做**存储隔离**
+   * 以及访问 KV 用。取不到时缓存退化为纯内存（不影响正确性）。
+   */
+  public storageId: any
+  public env: any
 
   constructor(addition: Yun139Addition) {
     this.addition = addition
@@ -481,7 +496,54 @@ export class Yun139ApiClient {
     this.inited = true
   }
 
+  /**
+   * 列目录。
+   *
+   * ## 缓存（性能关键）
+   *
+   * 线上实测：PROPFIND 连打十几次全部 200，但耗时在 1.0 ~ 7.5 秒之间跳动。
+   * 浏览时「进子目录 → 返回上级 → 再进」的节奏会反复请求**同一批目录**，
+   * 每次都做一次跨洲往返，既慢又浪费子请求配额（配额耗尽即 503）。
+   *
+   * 目录变化不频繁，60 秒 TTL 足以挡住这类重复请求，又不会让新增文件
+   * 长时间不可见。命中时**零网络往返**。
+   */
   async listFiles(folderId = ""): Promise<{
+    files: Yun139FileItem[]
+    folders: Array<{
+      catalogID: string
+      catalogName: string
+      updateTime?: string
+    }>
+  }> {
+    type ListResult = {
+      files: Yun139FileItem[]
+      folders: Array<{
+        catalogID: string
+        catalogName: string
+        updateTime?: string
+      }>
+    }
+
+    // ① 缓存命中：直接返回
+    const cached = await getCachedList<ListResult>(
+      this.addition,
+      this.storageId,
+      folderId,
+      this.env,
+    )
+    if (cached) return cached
+
+    // ② 回源
+    const result = await this.fetchListFiles(folderId)
+    if (result) {
+      setCachedList(this.addition, this.storageId, folderId, result)
+    }
+    return result
+  }
+
+  /** 真正向 139 拉目录（不含缓存），由 `listFiles` 调用 */
+  private async fetchListFiles(folderId = ""): Promise<{
     files: Yun139FileItem[]
     folders: Array<{
       catalogID: string
@@ -621,7 +683,53 @@ export class Yun139ApiClient {
     }
   }
 
+  /**
+   * 取文件直链（播放地址）。
+   *
+   * ## 缓存（性能关键）
+   *
+   * 线上实测：同一 .strm 的播放地址连打 8 次，全部 302 成功，但耗时在
+   * 2.0s / 6.4s / 7.2s / 9.5s / 13.8s / 13.9s 之间跳动 —— **波形 7 倍**。
+   * `wrangler tail` 显示 CPU 仅 64~160ms、零异常，时间全花在等 139 往返
+   * （Worker 出口在欧洲 AMS/LHR，139 机房在国内）。
+   *
+   * 客户端等不及就报「WebDAV 地址错误」，且**同一部片子时好时坏** ——
+   * 快的那些次能播，慢的那些次超时。这就是用户看到的现象。
+   *
+   * 139 返回的是 EOS 预签名直链，查询串带 `X-Amz-Expires=900`（15 分钟），
+   * 有效期内复用完全安全。故缓存 10 分钟，命中时**零网络往返**。
+   *
+   * ⚠️ 缓存键必须按存储隔离（`storageScope`），否则同一账号下多个存储
+   * （不同 root_folder_id）会互相串用 fileId → 取到别人的直链。
+   */
   async getDownloadUrl(contentIdOrFileId: string): Promise<string> {
+    if (!contentIdOrFileId) {
+      throw new Error("Empty file id passed to getDownloadUrl")
+    }
+
+    // ── ① 缓存命中：直接返回，不碰网络 ──────────────────────────────────
+    const hit = await getCachedLink(
+      this.addition,
+      this.storageId,
+      contentIdOrFileId,
+      this.env,
+    )
+    if (hit) {
+      return hit
+    }
+
+    // ── ② 未命中：回源 139 取直链，成功即写缓存 ─────────────────────────
+    const url = await this.fetchDownloadUrl(contentIdOrFileId)
+    if (url) {
+      setCachedLink(this.addition, this.storageId, contentIdOrFileId, url)
+    }
+    return url
+  }
+
+  /** 真正向 139 请求直链（不含缓存），由 `getDownloadUrl` 调用 */
+  private async fetchDownloadUrl(
+    contentIdOrFileId: string,
+  ): Promise<string> {
     if (this.isPersonalNew()) {
       const res = await this.request<PersonalDownloadResp>(
         "/file/getDownloadUrl",

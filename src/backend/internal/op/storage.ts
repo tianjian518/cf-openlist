@@ -63,6 +63,7 @@ import { DropboxDriver } from "../../drivers/dropbox/driver"
 import { WpsDriver } from "../../drivers/wps/driver"
 import { Yun139Driver } from "../../drivers/139/driver"
 import { resetPathIndexRequestBudget } from "../../drivers/139/pathindex"
+import { flushCache as flushLinkCacheStore } from "../../drivers/139/linkcache"
 import { MegaDriver } from "../../drivers/mega/driver"
 import { Pan115ShareDriver } from "../../drivers/115_share/driver"
 import { Pan123ShareDriver } from "../../drivers/123_share/driver"
@@ -1460,6 +1461,23 @@ export async function flushPendingDriverState(
       resetPathIndexRequestBudget()
     } catch {
       // 忽略：预算未重置只影响跨请求的索引复用，不影响功能
+    }
+
+    // ── 直链 / 目录缓存落盘 ─────────────────────────────────────────────
+    //
+    // 这一步是**整个缓存方案能否生效的关键**。
+    //
+    // CF Workers 的 isolate 会在 AMS/LHR 等机房之间漂移 —— 实测同一客户端
+    // 连续请求会落到不同机房，进程内 Map 命中率极低。缓存只有写进 KV 才能
+    // 真正跨请求复用；而 KV 写入走防抖，需要有人在请求结束前"推一把"。
+    //
+    // 不落盘的后果：直链缓存恒不命中 → 每次播放仍然是一次跨洲往返 →
+    // 耗时仍在 2~14 秒波动 → 播放器继续报「WebDAV 地址错误」。
+    try {
+      const ctxEnv = (driver as any).envCtx ?? requestContext?.env
+      await flushLinkCacheStore(ctxEnv)
+    } catch (e) {
+      console.warn(`[${driverName}] failed to flush link cache:`, e)
     }
   }
 

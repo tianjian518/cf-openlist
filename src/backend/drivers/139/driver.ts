@@ -56,6 +56,15 @@ export class Yun139Driver implements StorageDriver {
   setRuntimeContext(ctx: { storageId?: string | number; env?: any }): void {
     if (ctx.storageId !== undefined) this.storageId = ctx.storageId
     if (ctx.env !== undefined) this.envCtx = ctx.env
+    // ⚠️ 必须把 storageId / env 同步给 API client。
+    //
+    // 直链与目录缓存（`linkcache.ts`）需要 storageId 做**存储隔离** ——
+    // 同一账号可挂多个存储（root_folder_id 不同），若缓存键不含 storageId，
+    // A 存储的 fileId 会命中 B 存储的直链，取到**别人的文件**。
+    // env 用于访问 KV（跨 isolate 复用缓存，否则进程内缓存在机房漂移下
+    // 几乎不命中，优化形同虚设）。
+    this.client.storageId = this.storageId
+    this.client.env = this.envCtx
   }
 
   /** 索引操作所需的公共参数 */
