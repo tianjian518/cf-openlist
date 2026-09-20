@@ -156,3 +156,52 @@ test("139 client: getDownloadUrl 必须走缓存，且缓存键含 fileId", asyn
     "回源列目录必须拆成 fetchListFiles，由 listFiles 先查缓存再调用",
   )
 })
+
+/**
+ * 回归测试：CAS 清理任务**绝不能**注册到 `ctx.waitUntil`。
+ *
+ * ## 背景（2026-09-20 线上定位，播放卡 30+ 秒的元凶）
+ *
+ * 清理任务是「延时 120 秒后删除 TEMP 副本」，而 Cloudflare Workers 的
+ * `ctx.waitUntil` 容忍上限约 **30 秒**。把它注册上去的后果是：
+ * **每个播放请求都会被平台拖满 30 秒才结束**，即使 302 早已就绪。
+ *
+ * `wrangler tail` 实测（三条均已命中缓存，无需任何网络等待）：
+ *
+ *     [GET] 302  cpu=84ms  wall=34033ms
+ *     [GET] 302  cpu=86ms  wall=34910ms
+ *     [GET] 302  cpu=54ms  wall=32085ms
+ *
+ * 客户端（网易爆米花）等不到 30 秒 → 报「WebDAV 地址错误」；
+ * TEMP 被定时任务清空后又"自愈"，表现为**时好时坏 + 过几分钟恢复**。
+ *
+ * 这个 bug 极其隐蔽：所有请求都 `outcome=ok`、零报错，只是慢。
+ * 因此用测试把契约钉死：清理必须彻底脱离请求生命周期，
+ * 由 worker 的 `scheduled` 定时任务 `sweepTempFilesAll()` 兜底。
+ */
+test("139 CAS: 清理任务绝不能注册到 ctx.waitUntil（会拖死每个播放请求）", async () => {
+  const src = await read("./cas/player.ts")
+  const fn = src.match(/function scheduleCleanup[\s\S]*?\n\}/)
+  assert.ok(fn, "应能找到 scheduleCleanup 实现")
+  assert.ok(
+    !/ctx\.waitUntil\s*\(/.test(fn![0]),
+    "scheduleCleanup 不得调用 ctx.waitUntil —— 120 秒任务超出平台约 30 秒上限，会拖死请求",
+  )
+  assert.ok(
+    /waitUntil/.test(fn![0]),
+    "应保留说明性注释，讲清为何不能用 waitUntil（防止后人改回去）",
+  )
+})
+
+test("139 CAS: 定时任务 sweepTempFilesAll 必须存在（清理的真正兜底）", async () => {
+  const restoreSrc = await read("./cas/restore.ts")
+  assert.ok(
+    /export async function sweepTempFilesAll/.test(restoreSrc),
+    "清理脱离请求生命周期后，必须由 sweepTempFilesAll 兜底，否则 TEMP 会无限膨胀",
+  )
+  const workerSrc = await read("../../worker.ts")
+  assert.ok(
+    /sweepTempFilesAll/.test(workerSrc),
+    "worker 的 scheduled 必须调用 sweepTempFilesAll",
+  )
+})

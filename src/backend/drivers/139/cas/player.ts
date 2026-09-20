@@ -452,38 +452,61 @@ export async function resolveCasPlayLink(
 /**
  * 安排临时副本清理。
  *
- * ⚠️ 可靠性说明（重要）：
+ * ## ⚠️⚠️ 绝不能挂到 `ctx.waitUntil`（线上播放卡 30 秒的元凶，2026-09-20 定位）
  *
- * 这里原本依赖 `ctx.waitUntil` 在响应返回后延时删除，但该机制在
- * Cloudflare Workers 上**不足以**完成这件事：
- *   - 请求结束后 isolate 可能随时被回收，`waitUntil` 只保证约 30 秒；
- *   - 而 `cleanupDelayMs` 默认 120 秒，**远超过这个寿命**；
- *   - 加上没有任何地方向 `globalThis.__cas_ctx__` 赋值，
- *     `ctx` 恒为 `undefined`，任务会被直接丢弃。
+ * 本函数曾经把「延时 120 秒后删除副本」的任务交给 `ctx.waitUntil(task)`。
+ * 这在 Cloudflare Workers 上是**灾难性**的，因为 `waitUntil` 的语义是
+ * 「响应返回后，平台继续替你把任务跑完才释放该请求」：
  *
- * 结果就是：所有临时副本**永远留在 TEMP 里**。
+ *   - `waitUntil` 的容忍上限是 **约 30 秒**（远小于这里的 120 秒）；
+ *   - 于是**每个播放请求**都会被硬生生拖满 30 秒才结束；
+ *   - 超过上限后平台取消任务并打出：
+ *     `waitUntil() tasks did not complete within the allowed time
+ *      after invocation end and have been cancelled`
  *
- * 因此这里只把它当作"尽力而为"的快路径（延迟较短时有意义），
- * 真正的兜底由 worker 的 `scheduled` 定时任务调用
- * `sweepTempFilesAll()` 完成 —— 那条路径不受请求生命周期约束。
+ * ## 线上实测（铁证）
+ *
+ * `wrangler tail` 抓到三条 `.cas` 播放请求（均已命中直链缓存 `reused=true`，
+ * 也就是说 302 早已就绪、**不需要任何网络等待**）：
+ *
+ *     [GET] 302  cpu=84ms  wall=34033ms   ← 302 早就好了，被 waitUntil 拖了 34 秒
+ *     [GET] 302  cpu=86ms  wall=34910ms
+ *     [GET] 302  cpu=54ms  wall=32085ms
+ *
+ * 三条全部 `outcome=ok`、零报错，但客户端要等 30+ 秒。
+ * 网易爆米花等不到这么久 → 报「WebDAV 地址错误」（文案极具误导性）。
+ *
+ * 同时解释了两个此前无法理解的现象：
+ *   1. **过几分钟自己就好了** —— TEMP 被定时任务清空后，清理任务变轻，
+ *      累积的拖慢效应消失，于是"自愈"；
+ *   2. **播放时好时坏** —— TEMP 里副本越多，删除时的列目录越慢，
+ *      越接近播放器的超时线。
+ *
+ * ## 正确做法
+ *
+ * 清理**纯属后台事务**，与「把 302 交给播放器」毫无关系，绝不能占用请求时间：
+ *   - 这里只发起**不挂 waitUntil** 的 fire-and-forget 任务（尽力而为）；
+ *   - 真正的兜底由 worker 的 `scheduled` 定时任务 `sweepTempFilesAll()`
+ *     完成，那条路径不受请求生命周期约束，才是可靠的那一条。
  */
 function scheduleCleanup(
   client: Yun139ApiClient,
   fileId: string,
   delayMs: number,
 ): void {
-  const task = (async () => {
-    await new Promise((r) => setTimeout(r, delayMs))
-    await safeDelete(client, fileId)
-  })()
+  // ⚠️ 即使 `__cas_ctx__` 存在也**不要**注册 waitUntil：
+  //    120 秒的延时任务必然超出平台约 30 秒的容忍上限，只会拖死本次请求。
+  //    这里显式读取后忽略，防止后人"顺手"又把它挂上去。
+  void (globalThis as any).__cas_ctx__
 
-  // 尝试挂到 Workers 的 waitUntil（若可用）
-  const ctx = (globalThis as any).__cas_ctx__
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(task)
-  } else {
-    // 无 waitUntil：不能让未处理的 rejection 逃逸，也不能假装成功。
-    // 真正的清理依赖定时任务兜底。
-    task.catch(() => {})
-  }
+  // fire-and-forget：延迟删除，尽力而为；失败与超时都不影响播放，
+  // 漏删的副本由定时任务兜底清理。
+  void (async () => {
+    try {
+      await new Promise((r) => setTimeout(r, delayMs))
+      await safeDelete(client, fileId)
+    } catch {
+      // 忽略：清理失败不是错误，定时任务会兜底
+    }
+  })()
 }
