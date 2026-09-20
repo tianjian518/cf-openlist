@@ -480,6 +480,31 @@ export class StrmDriver implements StorageDriver {
     // `sub` 是挂载点之后的子路径，两者拼接即底层驱动认识的路径。
     const remotePath = joinPath(remote.physical, sub)
     try {
+      // ⚠️ 必须给底层驱动补注入运行时上下文。
+      //
+      // `injectRuntimeContext` 是在 `getDriver()` 的**调用点**执行的，只作用于
+      // 当前请求拿到的那个驱动（这里是 strm 自己）。strm 在 init 里**内部**
+      // 又调了一次 `getDriver()` 拿到 139 驱动实例，那次调用没有经过注入，
+      // 于是 139 驱动的 `storageId` / `envCtx` 恒为 undefined。
+      //
+      // 后果（实测）：139 的直链/目录缓存拿不到 storageId → 缓存键的存储隔离
+      // 退化；更致命的是拿不到 env → 缓存**永远写不进 KV**（`getBinding`
+      // 返回 null）→ 只剩进程内 Map，而 isolate 会在 AMS/LHR 之间漂移，
+      // 内存命中率极低 → 优化形同虚设，播放仍然卡 2~14 秒。
+      const t = remote.driver as any
+      if (typeof t.setRuntimeContext === "function") {
+        try {
+          // env 取全局注入的：index.ts 中间件每请求都会 `setEnvCtx(env)`，
+          // 这是最可靠的来源（storage 对象上并不携带 env）。
+          const mod: any = await import("../../internal/model/db")
+          t.setRuntimeContext({
+            storageId: (remote.storage as any)?.id,
+            env: mod.getEnvCtx?.(),
+          })
+        } catch {
+          /* 注入失败不影响主流程，缓存会退化为纯内存 */
+        }
+      }
       return await remote.driver.list("", remotePath)
     } catch (e: any) {
       // ⚠️ 不能静默吞异常。返回空数组会让上层认为「目录里没这个文件」，

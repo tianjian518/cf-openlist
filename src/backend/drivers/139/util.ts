@@ -530,7 +530,6 @@ export class Yun139ApiClient {
       this.addition,
       this.storageId,
       folderId,
-      this.env,
     )
     if (cached) return cached
 
@@ -712,7 +711,6 @@ export class Yun139ApiClient {
       this.addition,
       this.storageId,
       contentIdOrFileId,
-      this.env,
     )
     if (hit) {
       return hit
